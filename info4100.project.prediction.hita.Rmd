@@ -1,0 +1,719 @@
+---
+title: 'Group Project: Early Alert with LMS Data'
+author: '[[Lutian Wang lw796, ADD YOUR NAME, CORNELL ID]]'
+subtitle: INFO 4100/5101 Learning Analytics
+output:
+  pdf_document: default
+  word_document: default
+  html_document:
+    df_print: paged
+editor_options: 
+  markdown: 
+    wrap: sentence
+---
+
+```{r warning=FALSE, message=FALSE, echo=FALSE}
+library(tidyverse)
+# This loads 2 datasets: a=activities, con=conversations
+load("info4100_hita_data.rda")
+```
+
+# Introduction
+
+**Goals:** The goal of this project is to learn how to work with raw Learning Management System (LMS) data and apply some of the prediction skills you have learned so far.
+You will develop an early warning system for students who miss an elaboration activity submission.
+I am sharing with you an export of the class's HITA log data thus far.
+I have anonymized the dataset and performed minimal data cleaning, leaving plenty of real-world messiness for you to tackle here.
+As always, you should start by getting to know the datasets.
+In this case, you should be able to really understand what is going on because it is YOUR data.
+
+**Group Project:** This is a group project and I expect you to work as a team to come up with the best possible prediction accuracy.
+Your team will submit one common solution.
+
+**Grading and Rubric:** This group project counts to your final grade as specified in the syllabus.
+Grading will be done using the following rubrics with 0, 1, or 2 points in each rubric: 0 if your submission didn't do it or got it wrong; 1 for a partially correct answer; and 2 for a correct answer.
+1.
+Understanding the Data: Does the student exhibit an understanding of the dataset?
+2.
+Preparing the Data: Does the student adequately prepare the dataset for analysis (outcome, features, timing consideration)?
+3.
+Splitting the Data: Does the student split the data into a training and test set?
+4.
+Training Prediction Models: Does the student train a model and report the accuracy on the training set?
+5.
+Testing Prediction Models: Does the student test the trained model on the hold-out set and report accuracy?
+6.
+Summarizing Results: Does the student provide a coherent and informative summary about the feasibility and accuracy of the early warning system?
+
+**Try Your Best:** All members of the TWO teams that achieve the highest F1 scores will receive an extra credit point, and their solutions will be featured.
+To be eligible, your prediction problem needs to be set up correctly (i.e. everything else needs to be correct).
+
+# Step 1: Understand the data
+
+There are two datasets which can be connected using the student_id column (a hashed version of the user email) and in some cases the activity_step_id column (an id to connect conversations to activities):
+
+1.  Conversation data (1 row per student per message): this includes all messages sent in the general chat and in the activities, with information about the message time (created_at), message length (length_char), and whether it was sent by the AI vs. student (system: 1=AI, 0=student); conversations that occur within an Activity (reading elaboration or homework help) have an activity_step_id, otherwise this shows an NA value; you can trace what system message were sent in response to a student message using the src_id and reply_to_id columns.
+
+2.  Activities data (1 row per activity per student): this includes binary started and completed indicator for all activities and students who at least started them.
+
+You can convert any date-time column `X` into a numeric `timestamp` which may be helpful (but optional): `as.numeric(as.POSIXct(X, tz = "UTC"))`.
+Just note that the timezone is UTC not EST.
+
+*Question 1:* In the space below, explore each dataset using `head()`, `n_distinct(data$some_id)`, `summary()`, `table(data$column)`.
+You can also plot the distribution of variables with histograms or boxplots.
+
+```{r}
+############################################### 
+###### BEGIN INPUT: Explore each dataset ###### 
+###############################################
+
+# Exploring Conversations data
+head(con)
+n_distinct(con$student_id)
+summary(con)
+table(con$system)
+hist(con$length_char)
+str(con) 
+summary(con$length_char) # message length distribution
+# time patterns: see when messages occur
+con$hour <- lubridate::hour(con$created_at)
+table(con$hour)  
+# how many messages are within activities vs. general chat?
+table(is.na(con$activity_step_id))
+
+# Exploring Activities data
+head(a)
+n_distinct(a$name)
+summary(a)
+table(a$started, a$completed)
+table(a$name)
+#group by student_id and calculate totals
+student_activity_summary <- a %>%
+  group_by(student_id) %>%
+  summarise(
+    total_started = sum(started),
+    total_completed = sum(completed)
+  )
+hist(student_activity_summary$total_started)
+hist(student_activity_summary$total_completed)
+
+#look at the total started vs completed pattern
+elaboration_summary <- a %>%
+  filter(grepl("Elaboration", name)) %>%
+  summarise(
+    total_started = sum(started),
+    total_completed = sum(completed)
+  )
+print(elaboration_summary)
+
+#check how many activities strated/incompleted per student
+elaboration_patterns <- a %>%
+  filter(grepl("Elaboration", name)) %>%
+  group_by(student_id) %>%
+  summarise(
+    activities_started = sum(started),
+    activities_completed = sum(completed),
+    incomplete = sum(started > completed)
+  )
+print(elaboration_patterns)
+
+# exploring connections between datasets
+#compare student_ids between datasets
+n_distinct(con$student_id)  #number of students in conversations
+n_distinct(a$student_id)    #number of students in activities
+
+#look at how many conversations have activity_step_ids
+table(is.na(con$activity_step_id))
+
+# check which students appear in both datasets
+students_in_con <- unique(con$student_id)
+students_in_activities <- unique(a$student_id)
+length(intersect(students_in_con, students_in_activities))
+
+# Join conversations with activities and look at message patterns for completed vs incomplete activities
+con %>%
+  left_join(a, by = c("student_id", "activity_step_id")) %>%
+  group_by(completed) %>%
+  summarise(avg_messages = mean(n()))
+
+# look at average message lengths for different types of activities
+con %>%
+  filter(!is.na(activity_step_id)) %>%
+  group_by(activity_step_id) %>%
+  summarise(avg_length = mean(length_char))
+###############################################
+###############################################
+```
+
+# Step 2: Define a prediction task
+
+Recall the guidelines for defining a good prediction problem covered in the Handbook chapter on prediction.
+You are looking for something actionable (an opportunity to intervene) and a situation that repeats (so the prediction can be useful in the future).
+The trade-off with the dataset you have here is that on the one hand it is very relevant to you but on the other hand it is relatively small.
+Still, the data is fine-grained and sufficiently messy to give you a taste of LMS data analysis.
+
+The prediction problem for this project is to build a one-day early warning system for missing an elaboration activity submission.
+Specifically, **your goal is to predict one day before the submission deadline, if a student will forget to complete the elaboration activity**, so that the system can send a reminder.
+As you may have noticed during the data exploration phase above (if not, you should go back and examine this), there are several elaboration activities and some students who started but did not complete theirs.
+
+We define an **incomplete submission** as having a FALSE for `completed` or no activity record at all (meaning the student did not even start the activity).
+
+### Instructions
+
+Important note about the setup: The final prediction target (i.e. the test case) will be "Week 7 Reading Elaboration: Multimedia Learning".
+You should train your model to predict for all preceding elaboration activities (i.e., one in Week 2; two in Week 3; one in Week 6).
+Omit any Week 8 activities because they were not due when the data was extracted.
+You can use Homework Help activities to create features, but do not use them as training targets because these activities are optional.
+
+1.  Treat each elaboration activity assignment as a prediction task (thus there are x\*n prediction opportunities where x = number of elaboration activities and n = number of students who have had at least one conversation)
+2.  Create a dataset that has 1 row per student per elaboration activity with the binary outcome (did they MISS it? yes/no) and several predictors (see next tip)
+3.  Predictors (i.e. features) need to be engineered with data from **24hrs before each assignment is due**, which of course varies across assignments; that means you have much more information to predict later assignments than earlier ones. You should assume due dates are Saturdays at midnight EST (which is 5am UTC the same day). I provide the deadlines in UTC below.
+4.  Once your dataset is ready, split it into a training and a test set
+5.  Train a prediction model on the training data; you can try out any of the ones we have covered in the prediction homework and Random Forest
+6.  Keep tuning your model choice, model parameters (if any), and feature engineering
+7.  Finally, test your prediction accuracy on the test set
+
+**Reading Elaboration Deadlines (in UTC):** - Week 2: 2025-02-01 05:00:00 - Week 3: 2025-02-08 05:00:00 - Week 6: 2025-03-01 05:00:00 - Week 7: 2025-03-08 05:00:00
+
+# Step 3: Getting you started
+
+## Create the outcome variable
+
+**Identify the target activities and whether a student did NOT complete it**.
+Recall that we want to have a *warning* system, so the outcome should be the negative action (i.e. missing it).
+
+Get the missing outcome for each elaboration activity, associate the deadline for each one, and then compute the timestamp for 24hrs prior to its deadline.
+
+Now you know which elaboration activities to target.
+**Be sure to kick out the ones from Week 8**; They were not due yet when the export was created.
+
+*Question 2:* Now build a dataset with an indicator for each person and each elaboration activity with 1=incomplete/not started, 0=complete.
+Keep track of the deadline: you only want to use features based on data up to 24hrs before it (i.e. `24 * 60 * 60` seconds).
+Be sure to use all students in the `con` dataset as the basis, not just those who are in the `a` dataset because some students in the course may not have started any activity.
+
+```{r}
+############################################### 
+####### BEGIN INPUT: Define outcome ###########
+###############################################
+#library(stringr)
+
+# Step 1: Identify target activities
+target_activities <- c(
+  "Week 2 Reading Elaboration: Mining Big Data in Education",
+  "Week 3 Reading Elaboration: Algorithmic Bias and Fairness",
+  "Week 3 Reading Elaboration: Let's Debate!",
+  "Week 6 Reading Elaboration: Let's Debate Experiments!",
+  "Week 7 Reading Elaboration: Multimedia Learning"
+)
+
+# Step 2: Extract week numbers while keeping both Week 3 activities
+elaboration_activities <- a %>%
+  filter(name %in% target_activities) %>%
+  mutate(
+    activity_week = as.numeric(str_extract(name, "Week (\\d+)")),
+    name = str_trim(name)
+  ) %>%
+  select(student_id, activity_week, name, completed)
+
+# Step 3: Get unique student IDs
+students <- unique(con$student_id)
+
+# Step 4: Create a dataframe of elaboration deadlines, ensuring Week 3 has two activities
+deadlines <- data.frame(
+  activity_week = c(2, 3, 3, 6, 7),  # Week 3 appears twice (one for each activity)
+  activity_name = c(
+    "Week 2 Reading Elaboration: Mining Big Data in Education",
+    "Week 3 Reading Elaboration: Algorithmic Bias and Fairness",
+    "Week 3 Reading Elaboration: Let's Debate!",
+    "Week 6 Reading Elaboration: Let's Debate Experiments!",
+    "Week 7 Reading Elaboration: Multimedia Learning"
+  ),
+  deadline = as.POSIXct(c("2025-02-01 05:00:00", "2025-02-08 05:00:00", "2025-02-08 05:00:00", 
+                          "2025-03-01 05:00:00", "2025-03-08 05:00:00"), tz="UTC")
+)
+
+deadlines <- deadlines %>%
+  mutate(activity_name = str_trim(activity_name))
+
+# Step 5: Create all possible student-activity combinations (EXACTLY 5 rows per student)
+all_combinations <- students %>%
+  as.data.frame() %>%
+  rename(student_id = ".") %>%
+  crossing(deadlines)  # `crossing()` correctly expands only 5 rows per student
+
+# Step 6: Add deadlines to these combinations
+all_combinations <- all_combinations %>%
+  mutate(
+    deadline_timestamp = as.numeric(deadline),
+    cutoff_timestamp = deadline_timestamp - (24 * 60 * 60)  # 24 hours before deadline
+  )
+
+all_combinations <- all_combinations %>%
+  mutate(activity_name = str_trim(activity_name))
+
+# Step 7: Join with activities data (ensuring each student gets exactly 5 rows)
+all_combinations <- all_combinations %>%
+  left_join(elaboration_activities, 
+            by = c("student_id", "activity_name" = "name"))  # Match by activity name too
+
+# Step 8: Create the `missed` outcome variable
+all_combinations <- all_combinations %>%
+  mutate(
+    missed = ifelse(is.na(completed) | completed == FALSE, 1, 0)
+  )
+
+# Step 9: Verify dataset structure
+# Check that each student has exactly 5 rows (Week 3 should appear twice)
+table(all_combinations$student_id)  # Expecting 5 rows per student
+
+# Check number of unique students
+n_students <- length(unique(con$student_id))
+print(n_students)
+
+# Expected number of rows = n_students * 5
+expected_rows <- n_students * 5
+print(expected_rows)
+
+# View the first few rows
+head(all_combinations,30)
+
+table(all_combinations$completed, useNA = "ifany")
+
+############################################### 
+############################################### 
+```
+
+## Feature Engineering
+
+**For each elaboration activity, identify what data is appropriate for feature engineering**
+
+Before you start feature engineering, you need to constrain the data for **each** activity.
+
+Remember that the dataset we are aiming for has 1 row per student and activity with several feature variables and one outcome variable.
+You created the outcome above.
+Now you need to create the appropriate features to join.
+I'm giving you an example for a specific deadline and create two basic features from the conversation.
+You should try to create a lot more features, including complex ones, that can use the conversation and activity data (but remember the timing constraint).
+
+```{r}
+secs_in_day = 60 * 60 * 24
+example_deadline = as.numeric(as.POSIXct("2025-03-01 05:00:00", tz = "UTC"))
+
+example_features = con %>% 
+    filter(as.numeric(as.POSIXct(created_at, tz = "UTC")) < example_deadline - secs_in_day) %>%
+    group_by(student_id) %>%
+    summarise(
+        num_chat_conversations = n_distinct(conversation_id[is.na(activity_step_id)]),
+        avg_student_msg_len = mean(length_char[system==FALSE])
+    )
+
+head(example_features)
+```
+
+*Question 3:* Engineer features for each student and elaboration activity, subject to the timing constraint.
+
+```{r}
+############################################### 
+###### BEGIN INPUT: Engineer features #########
+###############################################
+
+secs_in_day <- 60 * 60 * 24
+
+# ✅ Feature Engineering - with more powerful features
+
+generate_features <- function(data, con) {
+  data <- data %>%
+    mutate(cutoff_time = deadline - secs_in_day)
+
+  feature_rows <- list()
+
+  for (i in 1:nrow(data)) {
+    sid <- data$student_id[i]
+    deadline <- data$deadline[i]
+    cutoff <- data$cutoff_time[i]
+    act_name <- data$activity_name[i]
+
+    con_filtered <- con %>%
+      filter(
+        student_id == sid,
+        as.POSIXct(created_at, tz = "UTC") < cutoff
+      )
+
+    con_student_msgs <- con_filtered %>% filter(system == 0)
+    con_ai_msgs <- con_filtered %>% filter(system == 1)
+    con_response_time <- con_filtered %>%
+      group_by(conversation_id) %>%
+      mutate(time_diff = as.numeric(difftime(created_at, lag(created_at), units = "mins")))
+
+    feature_row <- tibble(
+      student_id = sid,
+      activity_name = act_name,
+
+      total_msgs = nrow(con_filtered),
+      total_student_msgs = nrow(con_student_msgs),
+      avg_msg_length = mean(con_filtered$length_char, na.rm = TRUE),
+
+      num_activity_msgs = sum(!is.na(con_filtered$activity_step_id)),
+      num_general_msgs = sum(is.na(con_filtered$activity_step_id)),
+
+      active_hours_median = median(lubridate::hour(con_filtered$created_at), na.rm = TRUE),
+      active_hours_mean = mean(lubridate::hour(con_filtered$created_at), na.rm = TRUE),
+
+      student_response_ratio = ifelse(nrow(con_ai_msgs) == 0, 0, nrow(con_student_msgs) / nrow(con_ai_msgs)),
+
+      last_msg_time = max(as.POSIXct(con_filtered$created_at, tz = "UTC"), na.rm = TRUE),
+      last_msg_days_diff = as.numeric(difftime(cutoff, max(as.POSIXct(con_filtered$created_at, tz = "UTC"), na.rm = TRUE), units = "days")),
+
+      unique_conversations = n_distinct(con_filtered$conversation_id),
+      distinct_days_active = n_distinct(as.Date(con_filtered$created_at)),
+      
+      avg_response_time = mean(con_response_time$time_diff, na.rm = TRUE),
+      
+      time_to_deadline_mean = mean(difftime(cutoff, con_filtered$created_at, units = "days")),
+    )
+
+    feature_rows[[i]] <- feature_row
+  }
+
+  features_df <- bind_rows(feature_rows)
+  return(features_df)
+}
+
+# ⏳ Build features
+feature_data <- generate_features(all_combinations, con)
+
+# ⛓️ Merge into full dataset
+all_data <- all_combinations %>%
+  left_join(feature_data, by = c("student_id", "activity_name")) %>%
+  mutate(across(where(is.numeric), ~replace_na(., 0)))
+
+head(all_data, 10)
+###############################################
+###############################################
+```
+
+# Step 4: Split your dataset
+
+*Question 4:* We would like to train the model on earlier assessments in order to make early alert predictions for later ones.
+As the hold-out test set, designate the most recently due elaboration activity (i.e. the one for Week 7).
+You will use all the remaining data to train.
+Note that this may not be the best setup for all applications (e.g. if we wanted to use the model at the start of the course next year, but it is a reasonable approach if we wanted to use the model for the rest of this course offering).
+Identify the activity_id of the Week 7 activity and store data associated with that period in the `test` dataset.
+Take all the remaining data (earlier periods for prior weeks) and store them in the `train` dataset.
+
+```{r}
+############################################### 
+######## BEGIN INPUT: Split dataset ###########
+###############################################
+
+# 1. Identify Week 7 activities
+test <- all_combinations %>%
+  filter(activity_name == "Week 7 Reading Elaboration: Multimedia Learning")
+
+train <- all_combinations %>%
+  filter(activity_name != "Week 7 Reading Elaboration: Multimedia Learning")
+
+# 2. Verify the split
+cat("Test set size (Week 7):", nrow(test), "\n")
+cat("Training set size (Weeks 1-6):", nrow(train), "\n")
+
+# 3. Check the distribution of weeks in training data
+train_weeks <- train %>%
+  group_by(activity_name) %>%
+  summarise(count = n()) %>%
+  arrange(activity_name)
+
+print("Distribution of weeks in training data:")
+print(train_weeks)
+
+###############################################
+###############################################
+```
+
+# Step 5: Train your models
+
+*Question 5:* Train a prediction model and iterate on it.
+You should try out different algorithms that you have learned so far.
+You can go back and check your features and refine them to get better performance.
+To check how well you are doing, you should focus on your training data and compute the F1 score: `F1 = 2/[(1/recall)+(1/precision)]`.
+Report your F1 score on the training data below (don't forget this!).
+
+```{r}
+############################################### 
+####### BEGIN INPUT: Train and report #########
+###############################################
+library(tidyverse)
+library(class)  # For KNN
+#tree
+library(caret)
+library(rpart)
+library(e1071) #NB classifier
+library(randomForest)
+library(MLmetrics)
+
+# 1. Filter training data
+train_data <- all_data %>%
+  filter(activity_name != "Week 7 Reading Elaboration: Multimedia Learning")
+
+# 2. Select features and target
+features <- c(
+  "total_msgs",
+  "total_student_msgs",
+  "avg_msg_length",
+  "num_activity_msgs",
+  "num_general_msgs",
+  "active_hours_median",
+  "active_hours_mean",
+  "student_response_ratio",
+  "last_msg_days_diff",
+  "unique_conversations",
+  "distinct_days_active"
+)
+target <- "missed"
+
+# 3. Prepare model data
+model_data <- train_data %>%
+  select(all_of(c(features, target))) %>%
+  # Replace infinite values
+  mutate(across(all_of(features), ~ ifelse(is.infinite(.), NA, .))) %>%
+  drop_na() %>%
+  mutate(missed = factor(missed))  # Convert to factor for classification
+
+# 4. Split into features and target
+X <- model_data %>% select(all_of(features))
+y <- model_data$missed
+
+### ---------- LINEAR REGRESSION ----------
+lm_model <- lm(as.numeric(missed) - 1 ~ ., data = model_data)
+lm_pred <- predict(lm_model)
+optimal_threshold <- mean(lm_pred)
+lm_pred_binary <- ifelse(lm_pred > optimal_threshold, 1, 0)
+
+lm_cm <- table(Predicted = lm_pred_binary, Actual = as.numeric(as.character(y)))
+lm_precision <- lm_cm[2, 2] / sum(lm_cm[2, ])
+lm_recall <- lm_cm[2, 2] / sum(lm_cm[, 2])
+lm_f1 <- 2 * (lm_precision * lm_recall) / (lm_precision + lm_recall)
+
+### ---------- LOGISTIC REGRESSION ----------
+class_weights <- 1 / table(y)
+weights <- class_weights[y]
+
+log_model <- glm(missed ~ ., 
+                 data = model_data, 
+                 family = "binomial", 
+                 weights = weights)
+log_pred <- predict(log_model, type = "response")
+log_pred_binary <- ifelse(log_pred > 0.5, 1, 0)
+
+log_cm <- table(Predicted = log_pred_binary, Actual = as.numeric(as.character(y)))
+log_precision <- log_cm[2, 2] / sum(log_cm[2, ])
+log_recall <- log_cm[2, 2] / sum(log_cm[, 2])
+log_f1 <- 2 * (log_precision * log_recall) / (log_precision + log_recall)
+
+### ---------- K-NEAREST NEIGHBOR ----------
+X_scaled <- scale(X)
+k_values <- c(3, 5, 7)
+knn_results <- data.frame(k = integer(), f1_score = numeric())
+
+for (k in k_values) {
+  knn_pred <- knn(train = X_scaled, test = X_scaled, cl = y, k = k)
+  knn_cm <- table(Predicted = knn_pred, Actual = y)
+  tp <- sum(knn_pred == 1 & y == 1)
+  fp <- sum(knn_pred == 1 & y == 0)
+  fn <- sum(knn_pred == 0 & y == 1)
+  
+  knn_precision <- ifelse((tp + fp) == 0, 0, tp / (tp + fp))
+  knn_recall <- ifelse((tp + fn) == 0, 0, tp / (tp + fn))
+  knn_f1 <- ifelse((knn_precision + knn_recall) == 0, 0, 2 * (knn_precision * knn_recall) / (knn_precision + knn_recall))
+  
+  knn_results <- rbind(knn_results, data.frame(k = k, f1_score = knn_f1))
+}
+
+
+### ---------- Classification and Regression Trees ----------
+cart_model <- rpart(missed ~ ., data = model_data, method = "class",
+                    control = rpart.control(cp = 0.01))
+# Predict class probabilities on the training data
+cart_pred_prob <- predict(cart_model, model_data, type = "prob")
+
+# Optimize threshold for maximum F1 score
+thresholds_cart <- seq(0.1, 0.9, by = 0.01)
+f1_scores_cart <- sapply(thresholds_cart, function(th) {
+  preds <- ifelse(cart_pred_prob[, "1"] >= th, 1, 0)
+  F1_Score(y_true = as.numeric(as.character(y)), y_pred = preds, positive = 1)
+})
+best_threshold_cart <- thresholds_cart[which.max(f1_scores_cart)]
+best_f1_cart <- max(f1_scores_cart)
+
+cart_pred_binary <- ifelse(cart_pred_prob[, "1"] >= best_threshold_cart, 1, 0)
+cart_cm <- table(Predicted = cart_pred_binary, Actual = as.numeric(as.character(y)))
+
+
+### ---------- Naive Bayes Classifier ----------
+nb_model <- naiveBayes(missed ~ ., data = model_data)
+
+nb_pred_prob <- predict(nb_model, model_data, type = "raw")
+
+thresholds_nb <- seq(0.1, 0.9, by = 0.01)
+f1_scores_nb <- sapply(thresholds_nb, function(th) {
+  preds <- ifelse(nb_pred_prob[, "1"] >= th, 1, 0)
+  F1_Score(y_true = as.numeric(as.character(y)), y_pred = preds, positive = 1)
+})
+best_threshold_nb <- thresholds_nb[which.max(f1_scores_nb)]
+best_f1_nb <- max(f1_scores_nb)
+
+#best threshold
+nb_pred_binary <- ifelse(nb_pred_prob[, "1"] >= best_threshold_nb, 1, 0)
+nb_cm <- table(Predicted = nb_pred_binary, Actual = as.numeric(as.character(y)))
+
+cat("Naive Bayes Classifier:\n")
+print(nb_cm)
+cat("F1 Score:", round(best_f1_nb, 4), "\n\n")
+
+### ---------- Ensemble Methods: Random Forest ----------
+library(MLmetrics)
+
+model_data <- model_data %>%
+  mutate(missed = factor(missed, levels = c("0", "1"), labels = c("No", "Yes")))
+
+set.seed(123)
+rf_model <- randomForest(missed ~ ., data = model_data, ntree = 500)
+rf_pred_prob <- predict(rf_model, model_data, type = "prob")
+
+thresholds_rf <- seq(0.01, 0.99, by = 0.01)
+f1_values_rf <- sapply(thresholds_rf, function(th) {
+  pred_class <- ifelse(rf_pred_prob[, "Yes"] >= th, "Yes", "No")
+  MLmetrics::F1_Score(y_true = model_data$missed, y_pred = pred_class, positive = "Yes")
+})
+best_threshold_rf <- thresholds_rf[which.max(f1_values_rf)]
+best_f1_rf <- max(f1_values_rf)
+
+#final predictions with the optimal threshold
+rf_pred_binary <- ifelse(rf_pred_prob[, "Yes"] >= best_threshold_rf, "Yes", "No")
+rf_cm <- table(Predicted = rf_pred_binary, Actual = model_data$missed)
+
+cat("Random Forest Confusion Matrix:\n")
+print(rf_cm)
+cat("Random Forest F1 Score:", round(best_f1_rf, 4), "\n")
+
+
+
+### ---------- RESULTS ----------
+cat("\nModel Performance Metrics:\n")
+cat("Linear Regression:\n")
+print(lm_cm)
+cat("F1 Score:", round(lm_f1, 4), "\n\n")
+
+cat("Logistic Regression:\n")
+print(log_cm)
+cat("F1 Score:", round(log_f1, 4), "\n\n")
+
+cat("KNN Results (3, 5, 7):\n")
+print(knn_results)
+cat("F1 Score:", round(knn_results$f1_score, 4), "\n\n")
+
+cat("\nCART Model:\n")
+print(cart_cm)
+cat("F1 Score:", round(best_f1_cart, 4), "\n\n")
+
+cat("Naive Bayes Classifier:\n")
+print(nb_cm)
+cat("F1 Score:", round(best_f1_nb, 4), "\n\n")
+
+
+# Combine F1 results for bar plot
+results_df <- tibble(
+  Model = c("Linear", "Logistic", paste0("KNN (k=", k_values, ")"), "CART", "Naive Bayes", "Random Forest"),
+  F1_Score = c(lm_f1, log_f1, knn_results$f1_score, best_f1_cart, best_f1_nb,best_f1_rf))
+
+ggplot(results_df, aes(x = reorder(Model, -F1_Score), y = F1_Score)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  theme_minimal() +
+  labs(title = "Model F1 Score Comparison (Training Data)",
+       x = "Model", y = "F1 Score")
+
+############################################### 
+####### END: Train and report #################
+###############################################
+
+```
+
+# Step 6: Test your model
+
+*Question 6:* Using the model that you arrived at, predict on the held-out test data and report your final F1 score.
+Typically, you would only do this once at the very end, but for this project it is actually rather hard to do well on the test set, so you can try your model (sparingly to avoid overfitting too much) on the test data to compute the testing F1 score.
+
+```{r}
+############################################### 
+####### BEGIN INPUT: Test and report ##########
+###############################################
+
+
+# (Re)process the test data to ensure consistency with the training set
+test_data <- all_data %>%
+  filter(activity_name == "Week 7 Reading Elaboration: Multimedia Learning")
+
+test_data <- test_data %>%
+  select(all_of(c(features, target))) %>%
+  mutate(across(all_of(features), ~ ifelse(is.infinite(.), NA, .))) %>%
+  drop_na() %>%
+  mutate(missed = factor(missed, levels = c("0", "1"), labels = c("No", "Yes")))
+
+
+# Make predictions on the test dataset using the final Random Forest model
+# (rf_model and best_threshold_rf were computed earlier)
+rf_pred_prob_test <- predict(rf_model, test_data, type = "prob")
+rf_pred_binary_test <- ifelse(rf_pred_prob_test[, "Yes"] >= best_threshold_rf, "Yes", "No")
+
+#confusion matrix 
+test_cm <- table(Predicted = rf_pred_binary_test, Actual = test_data$missed)
+cat("Test Confusion Matrix:\n")
+print(test_cm)
+
+#precision and recall
+tp <- sum(rf_pred_binary_test == "Yes" & test_data$missed == "Yes")
+fp <- sum(rf_pred_binary_test == "Yes" & test_data$missed == "No")
+fn <- sum(rf_pred_binary_test == "No" & test_data$missed == "Yes")
+precision_test <- ifelse((tp + fp) == 0, 0, tp / (tp + fp))
+recall_test <- ifelse((tp + fn) == 0, 0, tp / (tp + fn))
+
+#compute F1 score: F1 = 2 / (1/precision + 1/recall)
+F1 <- 2 * (precision_test * recall_test) / (precision_test + recall_test)
+cat("Testing F1 score is:", round(F1, 4), "\n")
+
+###############################################
+###############################################
+```
+
+# Step 7: Report
+
+*Question 7:* As a team, write a brief report.
+Imagine your supervisor asked you to investigate the possibility of an early warning system.
+She would like to know what model to use, what features are important, and most importantly how well it would work.
+Given what you've learned, would you recommend implementing the system?
+Write your report answering the above questions here:
+
+%######## BEGIN INPUT: Summarize findings \############
+
+Add your summary here.
+
+%###############################################
+
+# Estimate time spent
+
+**We want to give students an estimate of how much time this project will take. Please indicate how many hours you spent as a team to complete this project here.**
+
+-   I spent [insert your time] hours.
+
+# Generative AI usage
+
+**As stated in the course syllabus, using generative AI is allowed to help you as you complete this project. We are interested in how it is being used and whether it is helpful for you.**
+
+-   How much did you use generative AI (e.g., not at all, some, most, or all the questions) and which one did you use?
+-   If you used generative AI, how did you use it and was it helpful?
+
+# Submit Project
+
+This is the end of the project.
+Please **Knit a Word doc report** that shows both the R code and R output (be sure to check the Word doc) and upload it on Canvas.
+One upload for the team before the deadline is sufficient.
