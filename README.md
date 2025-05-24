@@ -1,1 +1,2 @@
 # Kate-Li-Projects
+A repository of data analysis projects and assignments where I demonstrate proficiency in Python and R using analysis methods. These methods include exploratory data analysis, causal inference, hypothesis testing, K-means clustering, principal component analysis, letter tri-grams (and other text analysis methods), regressions, Naive Bayes modeling, singular value decomposition, and more. These projects also demonstrate proficiency using Python libraries including numpy, duckdb, matplot-lib, sci-kit-learn, seaborn, and more. 
